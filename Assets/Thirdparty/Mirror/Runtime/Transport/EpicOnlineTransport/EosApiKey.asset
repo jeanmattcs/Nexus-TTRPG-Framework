@@ -1,0 +1,21 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2006c7a2843279e4598781ed39185dd0, type: 3}
+  m_Name: EosApiKey
+  m_EditorClassIdentifier: 
+  epicProductName: Nexus
+  epicProductVersion: 1.0
+  epicProductId: 4a40ef185cd44dfdaee8945c48e38466
+  epicSandboxId: fba236790fa34907898552b7d5fe985d
+  epicDeploymentId: 160eb6b0a1d14184952114dff0531095
+  epicClientId: xyza78919ybutoB0XvNrhpU6SwZVkBZy
+  epicClientSecret: 4iIMcTrCgwCOrFkRai4b/6mMedm2SCuZssopLD8MW4s

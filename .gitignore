@@ -1,0 +1,31 @@
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+UserSettings/
+MemoryCaptures/
+
+# VS / Rider
+*.csproj
+*.sln
+*.user
+*.unityproj
+*.pidb
+*.suo
+*.vsp
+
+# Cache
+*.unitypackage
+*.DS_Store
+
+# Collab
+. plastic/
+.plastic/
+
+# Other
+*.apk
+*.aab
+/.vscode
+mono_crash.mem.12555.1.blob
