@@ -93,11 +93,15 @@ namespace Nexus
         [SerializeField] private float minHeightOffset = -5f;
         [SerializeField] private float maxHeightOffset = 5f;
 
+        [Header("Multi Selection")]
+        [SerializeField] private KeyCode multiSelectToggleKey = KeyCode.LeftShift;
+
         private Transform selectedObject;
         private Rigidbody selectedRigidbody;
 
         private bool isDragging = false;
         private bool isLocked = false;
+        private bool isMultiSelectMode = false;
         private float currentDistance;
         private Quaternion targetRotation;
         private bool wasKinematic;
@@ -106,6 +110,7 @@ namespace Nexus
 
         private Stack<UndoAction> undoStack = new();
         private GameObject copiedObject;
+        private readonly List<Transform> multiSelectedObjects = new();
         
         // Network throttling
         private float lastNetworkMoveTime = 0f;
@@ -179,6 +184,18 @@ namespace Nexus
         private void Update()
         {
             if (GetActive() != this) return;
+
+            if (Input.GetKeyDown(multiSelectToggleKey))
+            {
+                isMultiSelectMode = !isMultiSelectMode;
+                if (!isMultiSelectMode && selectedObject != null)
+                {
+                    multiSelectedObjects.Clear();
+                    multiSelectedObjects.Add(selectedObject);
+                }
+                Debug.Log($"Multi selection: {(isMultiSelectMode ? "ON" : "OFF")}");
+            }
+
             // Always ensure we have the correct camera, preferring the bound local player's camera
             if (boundLocalPlayer != null && boundLocalPlayer.isLocalPlayer && boundLocalPlayer.PlayerCamera != null && boundLocalPlayer.PlayerCamera.isActiveAndEnabled)
             {
@@ -245,16 +262,47 @@ namespace Nexus
 
                 if (bestTarget != null)
                 {
-                    if (selectedObject != bestTarget)
+                    bool shouldStartDrag = false;
+                    if (isMultiSelectMode)
                     {
-                        Deselect();
-                        Select(bestTarget);
+                        if (multiSelectedObjects.Contains(bestTarget))
+                        {
+                            multiSelectedObjects.Remove(bestTarget);
+                            if (selectedObject == bestTarget)
+                            {
+                                selectedObject = multiSelectedObjects.Count > 0 ? multiSelectedObjects[0] : null;
+                                selectedRigidbody = selectedObject != null ? selectedObject.GetComponentInChildren<Rigidbody>() : null;
+                            }
+                            if (selectedObject == null)
+                            {
+                                Deselect();
+                            }
+                        }
+                        else
+                        {
+                            Select(bestTarget, true);
+                            shouldStartDrag = true;
+                        }
                     }
+                    else
+                    {
+                        if (selectedObject != bestTarget)
+                        {
+                            Deselect();
+                            Select(bestTarget);
+                        }
+                        shouldStartDrag = true;
+                    }
+
+                    if (shouldStartDrag && selectedObject != null)
+                        SaveStateAndStartDragging(bestHit);
+
                     Debug.Log($"Selected: {bestTarget.name} (Token: {bestIsToken}, Movable: {bestIsMovable})");
                 }
                 else
                 {
-                    Deselect();
+                    if (!isMultiSelectMode)
+                        Deselect();
                 }
             }
 
@@ -291,6 +339,10 @@ namespace Nexus
 
         private void MoveSelectedObject()
         {
+            if (selectedObject == null) return;
+
+            Vector3 previousPrimaryPosition = selectedObject.position;
+
             // Free 3D movement: mouse position at current distance from camera
             Vector3 mouseScreenPos = new Vector3(Input.mousePosition.x, Input.mousePosition.y, currentDistance);
             Vector3 targetPos = mainCamera.ScreenToWorldPoint(mouseScreenPos);
@@ -306,6 +358,17 @@ namespace Nexus
             else if (selectedObject != null)
             {
                 selectedObject.position = targetPos;
+            }
+
+            if (isMultiSelectMode && multiSelectedObjects.Count > 1)
+            {
+                Vector3 delta = selectedObject.position - previousPrimaryPosition;
+                for (int i = 0; i < multiSelectedObjects.Count; i++)
+                {
+                    var token = multiSelectedObjects[i];
+                    if (token == null || token == selectedObject) continue;
+                    token.position += delta;
+                }
             }
         }
 
@@ -449,7 +512,7 @@ namespace Nexus
         // ===============================
         // ========= UTILITIES ===========
         // ===============================
-        public void Select(Transform obj)
+        public void Select(Transform obj, bool additive = false)
         {
             // Always prefer the Token root as the selected object
             Transform root = obj;
@@ -461,6 +524,16 @@ namespace Nexus
             Rigidbody rb = root.GetComponentInChildren<Rigidbody>();
             selectedRigidbody = (rb != null && (rb.transform == root || rb.transform.IsChildOf(root))) ? rb : null;
             targetRotation = root.rotation;
+
+            if (!additive)
+            {
+                multiSelectedObjects.Clear();
+            }
+
+            if (!multiSelectedObjects.Contains(root))
+            {
+                multiSelectedObjects.Add(root);
+            }
         }
 
         private void Deselect()
@@ -472,6 +545,7 @@ namespace Nexus
             selectedRigidbody = null;
             isDragging = false;
             isLocked = false;
+            multiSelectedObjects.Clear();
         }
 
         private void SaveStateAndStartDragging(RaycastHit hit)
@@ -540,13 +614,31 @@ namespace Nexus
                 }
             }
             
-            undoStack.Push(new UndoAction
+            if (isMultiSelectMode && multiSelectedObjects.Count > 1)
             {
-                actionType = UndoActionType.Move,
-                targetObject = selectedObject.gameObject,
-                oldPosition = oldPos,
-                oldRotation = oldRot
-            });
+                for (int i = 0; i < multiSelectedObjects.Count; i++)
+                {
+                    var token = multiSelectedObjects[i];
+                    if (token == null) continue;
+                    undoStack.Push(new UndoAction
+                    {
+                        actionType = UndoActionType.Move,
+                        targetObject = token.gameObject,
+                        oldPosition = token.position,
+                        oldRotation = token.rotation
+                    });
+                }
+            }
+            else
+            {
+                undoStack.Push(new UndoAction
+                {
+                    actionType = UndoActionType.Move,
+                    targetObject = selectedObject.gameObject,
+                    oldPosition = oldPos,
+                    oldRotation = oldRot
+                });
+            }
         }
 
         private void StopDragging()
