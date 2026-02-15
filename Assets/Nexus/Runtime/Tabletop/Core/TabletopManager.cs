@@ -93,8 +93,23 @@ namespace Nexus
         [SerializeField] private float minHeightOffset = -5f;
         [SerializeField] private float maxHeightOffset = 5f;
 
+        // Multi-selection support
+        private HashSet<Transform> selectedObjects = new HashSet<Transform>();
+        private Transform primarySelected; // The "leader" token for group drag
+        private Dictionary<Transform, Vector3> dragOffsets = new Dictionary<Transform, Vector3>();
+
+        // Legacy single-selection (kept for compatibility, now points to primarySelected)
         private Transform selectedObject;
         private Rigidbody selectedRigidbody;
+
+        // Drag state per token
+        private class DragState
+        {
+            public Rigidbody rb;
+            public bool wasKinematic;
+            public bool hadGravity;
+        }
+        private Dictionary<Transform, DragState> dragStates = new Dictionary<Transform, DragState>();
 
         private bool isDragging = false;
         private bool isLocked = false;
@@ -219,8 +234,13 @@ namespace Nexus
         // ===============================
         private void HandleSelection()
         {
+            bool shiftPressed = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+
             if (Input.GetMouseButtonDown(0))
             {
+                // Disable TokenDraggable to prevent conflicts
+                DisableTokenDraggableOnClick();
+
                 Ray ray = mainCamera.ScreenPointToRay(Input.mousePosition);
                 RaycastHit[] hits = Physics.RaycastAll(ray, 500f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide);
                 System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
@@ -245,16 +265,62 @@ namespace Nexus
 
                 if (bestTarget != null)
                 {
-                    if (selectedObject != bestTarget)
+                    // Multi-selection with Shift
+                    if (shiftPressed)
                     {
-                        Deselect();
-                        Select(bestTarget);
+                        // Toggle selection
+                        if (selectedObjects.Contains(bestTarget))
+                        {
+                            // Remove from selection
+                            selectedObjects.Remove(bestTarget);
+                            if (primarySelected == bestTarget)
+                            {
+                                // Choose new primary from remaining selection
+                                primarySelected = selectedObjects.Count > 0 ?
+                                    System.Linq.Enumerable.First(selectedObjects) : null;
+                            }
+                            selectedObject = primarySelected;
+                            Debug.Log($"Deselected: {bestTarget.name} (Remaining: {selectedObjects.Count})");
+                        }
+                        else
+                        {
+                            // Add to selection
+                            selectedObjects.Add(bestTarget);
+                            primarySelected = bestTarget; // Last clicked becomes primary
+                            selectedObject = primarySelected;
+                            Select(bestTarget);
+                            Debug.Log($"Added to selection: {bestTarget.name} (Total: {selectedObjects.Count})");
+                        }
+
+                        // Don't start dragging when shift-clicking (just selecting)
                     }
-                    Debug.Log($"Selected: {bestTarget.name} (Token: {bestIsToken}, Movable: {bestIsMovable})");
+                    else
+                    {
+                        // Normal click: check if clicking on already selected token
+                        bool clickedOnSelected = selectedObjects.Contains(bestTarget);
+
+                        if (!clickedOnSelected)
+                        {
+                            // Clicking on new token: clear selection and select only this one
+                            Deselect();
+                            selectedObjects.Add(bestTarget);
+                            primarySelected = bestTarget;
+                            selectedObject = primarySelected;
+                            Select(bestTarget);
+                            Debug.Log($"Selected: {bestTarget.name} (Token: {bestIsToken}, Movable: {bestIsMovable})");
+                        }
+
+                        // Start dragging (works for single or group)
+                        SaveStateAndStartDragging(bestHit);
+                    }
                 }
                 else
                 {
-                    Deselect();
+                    // Clicked empty space
+                    if (!shiftPressed)
+                    {
+                        Deselect();
+                    }
                 }
             }
 
@@ -264,6 +330,16 @@ namespace Nexus
                 {
                     StopDragging();
                 }
+            }
+        }
+
+        private void DisableTokenDraggableOnClick()
+        {
+            // Disable all TokenDraggable components to prevent conflicts
+            var allDraggables = Object.FindObjectsOfType<TokenDraggable>();
+            foreach (var draggable in allDraggables)
+            {
+                draggable.enabled = false;
             }
         }
 
@@ -291,22 +367,145 @@ namespace Nexus
 
         private void MoveSelectedObject()
         {
-            // Free 3D movement: mouse position at current distance from camera
-            Vector3 mouseScreenPos = new Vector3(Input.mousePosition.x, Input.mousePosition.y, currentDistance);
-            Vector3 targetPos = mainCamera.ScreenToWorldPoint(mouseScreenPos);
-            // Preserve current Y so TokenSetup handles vertical snap to ground exclusively
-            if (selectedObject != null)
-                targetPos.y = selectedObject.position.y;
-            
-            if (selectedRigidbody != null)
+            if (primarySelected == null || selectedObjects.Count == 0)
+                return;
+
+            // Calculate leader target position using drag plane + ground detection
+            Ray ray = mainCamera.ScreenPointToRay(Input.mousePosition);
+            Vector3 leaderTarget;
+            bool foundGround = false;
+
+            // Use drag plane for XZ position (prevents token from coming towards camera)
+            if (dragPlaneActive && dragPlane.Raycast(ray, out float enter))
             {
-                // Direct position update for kinematic rigidbody
-                selectedRigidbody.MovePosition(targetPos);
+                Vector3 planeHitPoint = ray.GetPoint(enter);
+
+                // Do a downward raycast from the plane hit to find actual ground
+                // Start probe above the plane hit point
+                Vector3 probeStart = new Vector3(planeHitPoint.x, planeHitPoint.y + 10f, planeHitPoint.z);
+
+                if (Physics.Raycast(probeStart, Vector3.down, out RaycastHit downHit, maxGroundProbeDistance, moveSurfaceMask, QueryTriggerInteraction.Ignore))
+                {
+                    // Check if we hit a token (skip it)
+                    bool hitToken = downHit.transform.GetComponentInParent<TokenSetup>() != null;
+
+                    if (!hitToken && downHit.normal.y >= minGroundNormalY)
+                    {
+                        // Found valid ground, use it
+                        leaderTarget = downHit.point + Vector3.up * (tokenHalfHeight + groundSnapOffset);
+                        foundGround = true;
+                    }
+                    else
+                    {
+                        // Hit token or steep surface, use XZ from plane but keep current Y
+                        leaderTarget = new Vector3(planeHitPoint.x, primarySelected.position.y, planeHitPoint.z);
+                        foundGround = true;
+                    }
+                }
+                else
+                {
+                    // No ground found below plane, keep current Y
+                    leaderTarget = new Vector3(planeHitPoint.x, primarySelected.position.y, planeHitPoint.z);
+                    foundGround = true;
+                }
             }
-            else if (selectedObject != null)
+            else
             {
-                selectedObject.position = targetPos;
+                // Fallback: use fixed distance from camera
+                Vector3 mouseScreenPos = new Vector3(Input.mousePosition.x, Input.mousePosition.y, currentDistance);
+                Vector3 screenWorldPoint = mainCamera.ScreenToWorldPoint(mouseScreenPos);
+
+                // Try to find ground below this point
+                Vector3 probeStart = new Vector3(screenWorldPoint.x, screenWorldPoint.y + 10f, screenWorldPoint.z);
+
+                if (Physics.Raycast(probeStart, Vector3.down, out RaycastHit downHit, maxGroundProbeDistance, moveSurfaceMask, QueryTriggerInteraction.Ignore))
+                {
+                    // Check if we hit a token (skip it)
+                    bool hitToken = downHit.transform.GetComponentInParent<TokenSetup>() != null;
+
+                    if (!hitToken && downHit.normal.y >= minGroundNormalY)
+                    {
+                        leaderTarget = downHit.point + Vector3.up * (tokenHalfHeight + groundSnapOffset);
+                        foundGround = true;
+                    }
+                    else
+                    {
+                        leaderTarget = new Vector3(screenWorldPoint.x, primarySelected.position.y, screenWorldPoint.z);
+                        foundGround = true;
+                    }
+                }
+                else
+                {
+                    // No ground found, use screen point with current Y
+                    leaderTarget = new Vector3(screenWorldPoint.x, primarySelected.position.y, screenWorldPoint.z);
+                }
             }
+
+            // Move all selected tokens maintaining formation
+            foreach (var token in selectedObjects)
+            {
+                if (token == null) continue;
+
+                // Calculate target position with offset
+                Vector3 offset = dragOffsets.ContainsKey(token) ? dragOffsets[token] : Vector3.zero;
+                Vector3 targetPos = leaderTarget + offset;
+
+                // For tokens with offset, also check ground height at their position
+                if (offset.sqrMagnitude > 0.01f && foundGround)
+                {
+                    Vector3 tokenProbeStart = new Vector3(targetPos.x, targetPos.y + 10f, targetPos.z);
+                    if (Physics.Raycast(tokenProbeStart, Vector3.down, out RaycastHit tokenGroundHit, maxGroundProbeDistance, moveSurfaceMask, QueryTriggerInteraction.Ignore))
+                    {
+                        // Check if we hit a token (skip it)
+                        bool hitToken = tokenGroundHit.transform.GetComponentInParent<TokenSetup>() != null;
+
+                        if (!hitToken && tokenGroundHit.normal.y >= minGroundNormalY)
+                        {
+                            // Adjust Y to match ground at this token's position
+                            float tokenHeight = ComputeHalfHeight(token);
+                            targetPos.y = tokenGroundHit.point.y + tokenHeight + groundSnapOffset;
+                        }
+                    }
+                }
+
+                // Use rigidbody if available
+                if (dragStates.ContainsKey(token) && dragStates[token].rb != null)
+                {
+                    dragStates[token].rb.MovePosition(targetPos);
+                }
+                else
+                {
+                    token.position = targetPos;
+                }
+            }
+
+            // Send periodic network updates during drag to prevent flickering
+            bool networkActive = Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected;
+            if (networkActive && Time.time - lastNetworkMoveTime > networkMoveInterval)
+            {
+                foreach (var token in selectedObjects)
+                {
+                    if (token == null) continue;
+
+                    var netToken = token.GetComponentInParent<Nexus.Networking.NetworkedToken>();
+                    if (netToken != null && netToken.netIdentity != null)
+                    {
+                        netToken.CmdUpdatePosition(token.position);
+                    }
+                    else
+                    {
+                        var netMovable = token.GetComponentInParent<Nexus.Networking.NetworkedMovable>();
+                        if (netMovable != null && netMovable.netIdentity != null)
+                        {
+                            netMovable.CmdUpdatePosition(token.position);
+                        }
+                    }
+                }
+                lastNetworkMoveTime = Time.time;
+            }
+
+            // Update legacy fields for compatibility
+            selectedObject = primarySelected;
         }
 
         // ===============================
@@ -332,13 +531,15 @@ namespace Nexus
             // Copy (Ctrl+C)
             if (IsCtrlPressed() && Input.GetKeyDown(KeyCode.C))
             {
-                if (selectedObject == null)
+                if (selectedObjects.Count == 0)
                 {
                     TrySelectUnderMouse();
                 }
-                if (selectedObject != null)
+                if (primarySelected != null)
                 {
-                    copiedObject = selectedObject.gameObject;
+                    // For now, only copy the primary selected object
+                    // TODO: Support copying multiple objects
+                    copiedObject = primarySelected.gameObject;
                     Debug.Log("Copied: " + copiedObject.name);
                 }
             }
@@ -354,7 +555,7 @@ namespace Nexus
                     {
                         // Calculate spawn position on client side using local camera
                         Vector3 spawnPos = FindValidSpawnPosition();
-                        
+
                         // Use client->server command via local NetworkPlayer
                         var localPlayerIdentity = Mirror.NetworkClient.localPlayer;
                         var localPlayer = localPlayerIdentity != null
@@ -372,13 +573,13 @@ namespace Nexus
                         // Original local spawning for non-networked objects
                         Vector3 spawnPos = FindValidSpawnPosition();
                         GameObject newObj = Instantiate(copiedObject, spawnPos, copiedObject.transform.rotation);
-                        
+
                         undoStack.Push(new UndoAction
                         {
                             actionType = UndoActionType.Create,
                             targetObject = newObj
                         });
-                        
+
                         Debug.Log("Pasted: " + newObj.name);
                     }
                 }
@@ -422,26 +623,36 @@ namespace Nexus
         {
             if (Input.GetKeyDown(KeyCode.Delete) || Input.GetKeyDown(KeyCode.Backspace))
             {
-                if (selectedObject == null)
+                if (selectedObjects.Count == 0)
                 {
                     TrySelectUnderMouse();
                 }
-                if (selectedObject != null)
+
+                if (selectedObjects.Count > 0)
                 {
-                    GameObject objToDelete = selectedObject.gameObject;
-                    Vector3 oldPos = objToDelete.transform.position;
-                    Quaternion oldRot = objToDelete.transform.rotation;
-                    
-                    undoStack.Push(new UndoAction
+                    // Delete all selected objects
+                    var objectsToDelete = new System.Collections.Generic.List<Transform>(selectedObjects);
+
+                    foreach (var obj in objectsToDelete)
                     {
-                        actionType = UndoActionType.Delete,
-                        targetObject = objToDelete,
-                        oldPosition = oldPos,
-                        oldRotation = oldRot
-                    });
-                    
+                        if (obj == null) continue;
+
+                        GameObject objToDelete = obj.gameObject;
+                        Vector3 oldPos = objToDelete.transform.position;
+                        Quaternion oldRot = objToDelete.transform.rotation;
+
+                        undoStack.Push(new UndoAction
+                        {
+                            actionType = UndoActionType.Delete,
+                            targetObject = objToDelete,
+                            oldPosition = oldPos,
+                            oldRotation = oldRot
+                        });
+
+                        objToDelete.SetActive(false);
+                    }
+
                     Deselect();
-                    objToDelete.SetActive(false);
                 }
             }
         }
@@ -456,6 +667,7 @@ namespace Nexus
             var token = obj.GetComponentInParent<TokenSetup>();
             if (token != null) root = token.transform;
 
+            // Update legacy fields for compatibility
             selectedObject = root;
             // Cache a rigidbody if it belongs to the same token hierarchy, but do not change selectedObject to it
             Rigidbody rb = root.GetComponentInChildren<Rigidbody>();
@@ -467,7 +679,9 @@ namespace Nexus
         {
             if (isDragging)
                 StopDragging();
-            
+
+            selectedObjects.Clear();
+            primarySelected = null;
             selectedObject = null;
             selectedRigidbody = null;
             isDragging = false;
@@ -476,39 +690,60 @@ namespace Nexus
 
         private void SaveStateAndStartDragging(RaycastHit hit)
         {
+            if (primarySelected == null || selectedObjects.Count == 0)
+                return;
+
             isDragging = true;
-            
-            Vector3 oldPos = selectedObject.position;
-            Quaternion oldRot = selectedObject.rotation;
-            
+            dragOffsets.Clear();
+            dragStates.Clear();
+
             // Use camera-forward depth so ScreenToWorldPoint doesn't jump to camera height
-            currentDistance = Mathf.Max(0.5f, Vector3.Dot(selectedObject.position - mainCamera.transform.position, mainCamera.transform.forward));
-            pivotToBottomOffset = ComputePivotToBottom(selectedObject);
-            tokenHalfHeight = ComputeHalfHeight(selectedObject);
+            currentDistance = Mathf.Max(0.5f, Vector3.Dot(primarySelected.position - mainCamera.transform.position, mainCamera.transform.forward));
+            pivotToBottomOffset = ComputePivotToBottom(primarySelected);
+            tokenHalfHeight = ComputeHalfHeight(primarySelected);
             // Build a stable drag plane from initial hit
             Vector3 planeNormal = hit.normal.y >= minGroundNormalY ? hit.normal : Vector3.up;
             dragPlane = new Plane(planeNormal, hit.point);
             dragPlaneActive = true;
             // Initialize free height offset so there is no jump when starting the drag
-            dragHeightOffset = selectedObject.position.y - (hit.point.y + tokenHalfHeight + groundSnapOffset);
-            
-            if (selectedRigidbody != null)
+            dragHeightOffset = primarySelected.position.y - (hit.point.y + tokenHalfHeight + groundSnapOffset);
+
+            // Calculate offsets and save states for all selected tokens
+            foreach (var token in selectedObjects)
             {
-                var identity = selectedObject.GetComponentInParent<Mirror.NetworkIdentity>();
+                if (token == null) continue;
+
+                // Calculate offset from primary
+                Vector3 offset = token.position - primarySelected.position;
+                dragOffsets[token] = offset;
+
+                // Save physics state
+                var rb = token.GetComponentInChildren<Rigidbody>();
+                if (rb != null && (rb.transform == token || rb.transform.IsChildOf(token)))
+                {
+                    var state = new DragState
+                    {
+                        rb = rb,
+                        wasKinematic = rb.isKinematic,
+                        hadGravity = rb.useGravity
+                    };
+                    dragStates[token] = state;
+
+                    // Make rigidbody kinematic during drag for precise control
+                    rb.velocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                    rb.isKinematic = true;
+                    rb.useGravity = false;
+                }
+
+                // Network: begin drag for each token
+                var identity = token.GetComponentInParent<Mirror.NetworkIdentity>();
                 bool networkActive = Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected;
                 bool identitySpawned = identity != null && identity.netId != 0 && (identity.isClient || identity.isServer);
-                wasKinematic = selectedRigidbody.isKinematic;
-                hadGravity = selectedRigidbody.useGravity;
-                
-                // Make rigidbody kinematic during drag for precise control
-                selectedRigidbody.velocity = Vector3.zero;
-                selectedRigidbody.angularVelocity = Vector3.zero;
-                selectedRigidbody.isKinematic = true;
-                selectedRigidbody.useGravity = false;
-                
+
                 if (identitySpawned && networkActive)
                 {
-                    var netToken = selectedObject.GetComponentInParent<Nexus.Networking.NetworkedToken>();
+                    var netToken = token.GetComponentInParent<Nexus.Networking.NetworkedToken>();
                     if (netToken != null)
                     {
                         if (netToken.netIdentity == null)
@@ -523,7 +758,7 @@ namespace Nexus
                     }
                     else
                     {
-                        var netMovable = selectedObject.GetComponentInParent<Nexus.Networking.NetworkedMovable>();
+                        var netMovable = token.GetComponentInParent<Nexus.Networking.NetworkedMovable>();
                         if (netMovable != null)
                         {
                             if (netMovable.netIdentity == null)
@@ -539,52 +774,133 @@ namespace Nexus
                     }
                 }
             }
-            
-            undoStack.Push(new UndoAction
+
+            // Push undo for group move
+            if (selectedObjects.Count == 1)
             {
-                actionType = UndoActionType.Move,
-                targetObject = selectedObject.gameObject,
-                oldPosition = oldPos,
-                oldRotation = oldRot
-            });
+                // Single object: use legacy undo
+                var token = primarySelected;
+                undoStack.Push(new UndoAction
+                {
+                    actionType = UndoActionType.Move,
+                    targetObject = token.gameObject,
+                    oldPosition = token.position,
+                    oldRotation = token.rotation
+                });
+            }
+            else
+            {
+                // Multiple objects: use multi-move undo
+                var entries = new System.Collections.Generic.List<MultiMoveEntry>();
+                foreach (var token in selectedObjects)
+                {
+                    if (token == null) continue;
+                    entries.Add(new MultiMoveEntry
+                    {
+                        target = token,
+                        oldPos = token.position,
+                        oldRot = token.rotation,
+                        newPos = token.position, // Will be updated on drag end
+                        newRot = token.rotation
+                    });
+                }
+                undoStack.Push(new UndoAction
+                {
+                    actionType = UndoActionType.MultiMove,
+                    multiMoveEntries = entries
+                });
+            }
+
+            // Update legacy fields for compatibility
+            selectedObject = primarySelected;
+            selectedRigidbody = dragStates.ContainsKey(primarySelected) ? dragStates[primarySelected].rb : null;
+            if (selectedRigidbody != null)
+            {
+                wasKinematic = dragStates[primarySelected].wasKinematic;
+                hadGravity = dragStates[primarySelected].hadGravity;
+            }
         }
 
         private void StopDragging()
         {
             isDragging = false;
 
-            if (selectedRigidbody != null)
-            {
-                selectedRigidbody.isKinematic = wasKinematic;
-                selectedRigidbody.useGravity = hadGravity;
-                selectedRigidbody.velocity = Vector3.zero;
-                selectedRigidbody.angularVelocity = Vector3.zero;
-            }
-
-            var netToken = selectedObject != null ? selectedObject.GetComponentInParent<Nexus.Networking.NetworkedToken>() : null;
             bool networkActive = Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected;
-            var identity = selectedObject != null ? selectedObject.GetComponentInParent<Mirror.NetworkIdentity>() : null;
-            bool identitySpawned = identity != null && identity.netId != 0 && (identity.isClient || identity.isServer);
-            if (netToken != null && netToken.netIdentity == null)
+
+            // Restore physics and send network updates for all selected tokens
+            foreach (var token in selectedObjects)
             {
-                Debug.LogWarning($"Skip CmdEndDragFinal on {netToken.name} because NetworkedToken.netIdentity is null (object not fully spawned?)");
-            }
-            else if (netToken != null && networkActive && identitySpawned)
-            {
-                var root = identity != null ? identity.transform : selectedObject;
-                netToken.CmdEndDragFinal(root.position, root.rotation);
-            }
-            else if (networkActive && identitySpawned)
-            {
-                var netMovable = selectedObject != null ? selectedObject.GetComponentInParent<Nexus.Networking.NetworkedMovable>() : null;
-                if (netMovable != null)
+                if (token == null) continue;
+
+                // Restore physics state
+                if (dragStates.ContainsKey(token))
                 {
-                    var root = identity != null ? identity.transform : selectedObject;
-                    netMovable.CmdEndDragFinal(root.position, root.rotation);
+                    var state = dragStates[token];
+                    if (state.rb != null)
+                    {
+                        state.rb.isKinematic = state.wasKinematic;
+                        state.rb.useGravity = state.hadGravity;
+                        state.rb.velocity = Vector3.zero;
+                        state.rb.angularVelocity = Vector3.zero;
+                    }
+                }
+
+                // Network: end drag for each token
+                var identity = token.GetComponentInParent<Mirror.NetworkIdentity>();
+                bool identitySpawned = identity != null && identity.netId != 0 && (identity.isClient || identity.isServer);
+
+                var netToken = token.GetComponentInParent<Nexus.Networking.NetworkedToken>();
+                if (netToken != null && netToken.netIdentity == null)
+                {
+                    Debug.LogWarning($"Skip CmdEndDragFinal on {netToken.name} because NetworkedToken.netIdentity is null (object not fully spawned?)");
+                }
+                else if (netToken != null && networkActive && identitySpawned)
+                {
+                    var root = identity != null ? identity.transform : token;
+                    netToken.CmdEndDragFinal(root.position, root.rotation);
+                }
+                else if (networkActive && identitySpawned)
+                {
+                    var netMovable = token.GetComponentInParent<Nexus.Networking.NetworkedMovable>();
+                    if (netMovable != null)
+                    {
+                        var root = identity != null ? identity.transform : token;
+                        netMovable.CmdEndDragFinal(root.position, root.rotation);
+                    }
                 }
             }
+
+            // Update undo stack with final positions for multi-move
+            if (undoStack.Count > 0)
+            {
+                var lastAction = undoStack.Peek();
+                if (lastAction.actionType == UndoActionType.MultiMove && lastAction.multiMoveEntries != null)
+                {
+                    foreach (var entry in lastAction.multiMoveEntries)
+                    {
+                        if (entry.target != null)
+                        {
+                            entry.newPos = entry.target.position;
+                            entry.newRot = entry.target.rotation;
+                        }
+                    }
+                }
+                else if (lastAction.actionType == UndoActionType.Move && lastAction.targetObject != null)
+                {
+                    lastAction.newPosition = lastAction.targetObject.transform.position;
+                    lastAction.newRotation = lastAction.targetObject.transform.rotation;
+                }
+            }
+
+            // Clear drag state
+            dragStates.Clear();
+            dragOffsets.Clear();
             dragPlaneActive = false;
             dragHeightOffset = 0f;
+
+            // Update legacy fields for compatibility
+            selectedObject = primarySelected;
+            selectedRigidbody = null;
         }
 
 
@@ -638,7 +954,17 @@ namespace Nexus
         Move,
         Rotate,
         Create,
-        Delete
+        Delete,
+        MultiMove
+    }
+
+    public class MultiMoveEntry
+    {
+        public Transform target;
+        public Vector3 oldPos;
+        public Quaternion oldRot;
+        public Vector3 newPos;
+        public Quaternion newRot;
     }
 
     public class UndoAction
@@ -650,30 +976,56 @@ namespace Nexus
         public Quaternion oldRotation;
         public Quaternion newRotation;
 
+        // For multi-move
+        public System.Collections.Generic.List<MultiMoveEntry> multiMoveEntries;
+
         public void Undo()
         {
-            if (targetObject == null)
-                return;
-
             switch (actionType)
             {
                 case UndoActionType.Move:
-                    targetObject.transform.position = oldPosition;
-                    targetObject.transform.rotation = oldRotation;
+                    if (targetObject != null)
+                    {
+                        targetObject.transform.position = oldPosition;
+                        targetObject.transform.rotation = oldRotation;
+                    }
                     break;
 
                 case UndoActionType.Rotate:
-                    targetObject.transform.rotation = oldRotation;
+                    if (targetObject != null)
+                    {
+                        targetObject.transform.rotation = oldRotation;
+                    }
                     break;
 
                 case UndoActionType.Create:
-                    Object.Destroy(targetObject);
+                    if (targetObject != null)
+                    {
+                        Object.Destroy(targetObject);
+                    }
                     break;
 
                 case UndoActionType.Delete:
-                    targetObject.SetActive(true);
-                    targetObject.transform.position = oldPosition;
-                    targetObject.transform.rotation = oldRotation;
+                    if (targetObject != null)
+                    {
+                        targetObject.SetActive(true);
+                        targetObject.transform.position = oldPosition;
+                        targetObject.transform.rotation = oldRotation;
+                    }
+                    break;
+
+                case UndoActionType.MultiMove:
+                    if (multiMoveEntries != null)
+                    {
+                        foreach (var entry in multiMoveEntries)
+                        {
+                            if (entry.target != null)
+                            {
+                                entry.target.position = entry.oldPos;
+                                entry.target.rotation = entry.oldRot;
+                            }
+                        }
+                    }
                     break;
             }
         }

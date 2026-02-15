@@ -86,6 +86,34 @@ namespace Nexus.Networking
         }
 
         [Command(requiresAuthority = false)]
+        public void CmdUpdatePosition(Vector3 position)
+        {
+            if (cachedRb != null)
+            {
+                cachedRb.position = position;
+            }
+            else
+            {
+                transform.position = position;
+            }
+            syncPosition = position;
+        }
+
+        [Command(requiresAuthority = false)]
+        public void CmdUpdateRotation(Quaternion rotation)
+        {
+            if (cachedRb != null)
+            {
+                cachedRb.rotation = rotation;
+            }
+            else
+            {
+                transform.rotation = rotation;
+            }
+            syncRotation = rotation;
+        }
+
+        [Command(requiresAuthority = false)]
         public void CmdBeginDrag()
         {
             if (!NetworkServer.active) return;
@@ -98,10 +126,10 @@ namespace Nexus.Networking
         public void CmdEndDragFinal(Vector3 finalPosition, Quaternion finalRotation)
         {
             if (!NetworkServer.active) return;
-            
+
             syncDragging = false;
             dragOwnerNetId = 0u;
-            
+
             if (cachedRb != null)
             {
                 cachedRb.position = finalPosition;
@@ -113,7 +141,7 @@ namespace Nexus.Networking
             }
             syncPosition = finalPosition;
             syncRotation = finalRotation;
-            
+
             RpcSnapTo(finalPosition, finalRotation);
         }
 
