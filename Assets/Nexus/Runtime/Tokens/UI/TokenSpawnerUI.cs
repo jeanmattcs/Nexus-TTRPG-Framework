@@ -241,7 +241,8 @@ public class TokenSpawnerUI : MonoBehaviour
             GameObject spawned = libraryManager.SpawnToken(tokenData, spawnPos, Quaternion.identity);
             if (spawned != null)
             {
-                // No debug: leave physics to the prefab/defaults
+                // Reuse the local placement safety pass to reduce clipping/overlap in offline mode.
+                AdjustTokenToGround(spawned);
             }
         }
     }

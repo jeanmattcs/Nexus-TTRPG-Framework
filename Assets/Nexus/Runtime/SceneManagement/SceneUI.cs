@@ -71,19 +71,18 @@ public class SceneUI : MonoBehaviour
         
         // Setup UI
         SetupButtons();
+        isOpen = startOpen;
         CreateSceneButtons();
         
         // Set initial state
         if (startOpen)
         {
-            isOpen = true;
             mainPanel.SetActive(true);
             // Only if the Scene UI starts open should it take control of cursor/input
             UpdateCursorState();
         }
         else
         {
-            isOpen = false;
             mainPanel.SetActive(false);
             // Do NOT touch cursor or input here; let other UIs (e.g. MultiplayerUI) manage them
         }
