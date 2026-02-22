@@ -294,6 +294,24 @@ namespace Nexus.Networking
             }
         }
 
+        [Command]
+        public void CmdDestroyNetworkObjectIdentity(Mirror.NetworkIdentity identity)
+        {
+            if (identity == null) return;
+            if (!Mirror.NetworkServer.active) return;
+
+            // Never allow clients to destroy player objects through the tabletop delete flow.
+            if (identity.GetComponent<Nexus.Networking.NetworkPlayer>() != null)
+                return;
+
+            var token = identity.GetComponent<Nexus.Networking.NetworkedToken>();
+            var movable = identity.GetComponent<Nexus.Networking.NetworkedMovable>();
+            if (token == null && movable == null)
+                return;
+
+            Mirror.NetworkServer.Destroy(identity.gameObject);
+        }
+
         private void OnDisable()
         {
             if (isLocalPlayer && playerCamera != null && Nexus.CameraManager.Instance != null)

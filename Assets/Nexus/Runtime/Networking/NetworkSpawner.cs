@@ -144,18 +144,20 @@ namespace Nexus.Networking
                     cols[i].isTrigger = false;
                 }
             }
-            // Ensure tokens have NetworkedToken for proper movement/sync
-            if (obj.GetComponent<Nexus.Networking.NetworkedToken>() == null && obj.GetComponent<TokenSetup>() != null)
+            // IMPORTANT: never add NetworkBehaviour components at runtime before NetworkServer.Spawn.
+            // Mirror requires server/client prefabs to have identical NetworkBehaviour layouts.
+            bool isToken = obj.GetComponent<TokenSetup>() != null;
+            if (isToken && obj.GetComponent<Nexus.Networking.NetworkedToken>() == null)
             {
-                obj.AddComponent<Nexus.Networking.NetworkedToken>();
+                Debug.LogError($"Cannot spawn token '{prefabName}' in multiplayer: prefab is missing NetworkedToken. Add the component to the prefab asset.");
+                Destroy(obj);
+                return;
             }
-            // Ensure non-token Movable objects get NetworkedMovable for sync
-            if (obj.GetComponent<TokenSetup>() == null && obj.GetComponent<Nexus.Networking.NetworkedMovable>() == null)
+            if (!isToken && obj.CompareTag("Movable") && obj.GetComponent<Nexus.Networking.NetworkedMovable>() == null)
             {
-                if (obj.CompareTag("Movable"))
-                {
-                    obj.AddComponent<Nexus.Networking.NetworkedMovable>();
-                }
+                Debug.LogError($"Cannot spawn movable '{prefabName}' in multiplayer: prefab is missing NetworkedMovable. Add the component to the prefab asset.");
+                Destroy(obj);
+                return;
             }
             NetworkServer.Spawn(obj);
         }

@@ -194,6 +194,12 @@ namespace Nexus
         private void Update()
         {
             if (GetActive() != this) return;
+            if (InputLocked)
+            {
+                if (isDragging)
+                    StopDragging();
+                return;
+            }
             // Always ensure we have the correct camera, preferring the bound local player's camera
             if (boundLocalPlayer != null && boundLocalPlayer.isLocalPlayer && boundLocalPlayer.PlayerCamera != null && boundLocalPlayer.PlayerCamera.isActiveAndEnabled)
             {
@@ -518,7 +524,10 @@ namespace Nexus
                 if (undoStack.Count > 0)
                 {
                     UndoAction action = undoStack.Pop();
-                    action.Undo();
+                    if (!TryUndoNetworkAware(action))
+                    {
+                        action.Undo();
+                    }
                 }
             }
         }
@@ -632,12 +641,43 @@ namespace Nexus
                 {
                     // Delete all selected objects
                     var objectsToDelete = new System.Collections.Generic.List<Transform>(selectedObjects);
+                    bool networkActive = Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected;
+                    var localPlayerIdentity = Mirror.NetworkClient.localPlayer;
+                    var localPlayer = localPlayerIdentity != null
+                        ? localPlayerIdentity.GetComponent<Nexus.Networking.NetworkPlayer>()
+                        : FindLocalNetworkPlayer();
 
                     foreach (var obj in objectsToDelete)
                     {
                         if (obj == null) continue;
 
                         GameObject objToDelete = obj.gameObject;
+                        bool handledByNetwork = false;
+                        if (networkActive)
+                        {
+                            var identity = objToDelete.GetComponentInParent<Mirror.NetworkIdentity>();
+                            if (identity != null && identity.netId != 0)
+                            {
+                                // Prefer command path (client/host local player), fallback to direct server destroy when hosting.
+                                if (localPlayer != null)
+                                {
+                                    localPlayer.CmdDestroyNetworkObjectIdentity(identity);
+                                    handledByNetwork = true;
+                                }
+                                else if (Mirror.NetworkServer.active)
+                                {
+                                    if (identity.GetComponentInParent<Nexus.Networking.NetworkPlayer>() == null)
+                                    {
+                                        Mirror.NetworkServer.Destroy(identity.gameObject);
+                                        handledByNetwork = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (handledByNetwork)
+                            continue;
+
                         Vector3 oldPos = objToDelete.transform.position;
                         Quaternion oldRot = objToDelete.transform.rotation;
 
@@ -913,6 +953,75 @@ namespace Nexus
                 if (p.isLocalPlayer) return p;
             }
             return null;
+        }
+
+        private bool TryUndoNetworkAware(UndoAction action)
+        {
+            if (action == null) return false;
+            if (!(Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected)) return false;
+
+            switch (action.actionType)
+            {
+                case UndoActionType.Move:
+                    ApplyUndoTransformSmart(action.targetObject, action.oldPosition, action.oldRotation);
+                    return action.targetObject != null;
+
+                case UndoActionType.Rotate:
+                    if (action.targetObject != null)
+                    {
+                        ApplyUndoTransformSmart(action.targetObject, action.targetObject.transform.position, action.oldRotation);
+                        return true;
+                    }
+                    return false;
+
+                case UndoActionType.MultiMove:
+                    if (action.multiMoveEntries == null) return false;
+                    bool any = false;
+                    foreach (var entry in action.multiMoveEntries)
+                    {
+                        if (entry?.target == null) continue;
+                        ApplyUndoTransformSmart(entry.target.gameObject, entry.oldPos, entry.oldRot);
+                        any = true;
+                    }
+                    return any;
+            }
+
+            return false;
+        }
+
+        private void ApplyUndoTransformSmart(GameObject target, Vector3 position, Quaternion rotation)
+        {
+            if (target == null) return;
+
+            bool sent = TrySendNetworkTransformUndo(target, position, rotation);
+
+            // Apply locally for immediate feedback (server/replication will converge the final state).
+            target.transform.SetPositionAndRotation(position, rotation);
+
+            if (!sent)
+                return;
+        }
+
+        private bool TrySendNetworkTransformUndo(GameObject target, Vector3 position, Quaternion rotation)
+        {
+            if (target == null) return false;
+            if (!(Mirror.NetworkServer.active || Mirror.NetworkClient.isConnected)) return false;
+
+            var netToken = target.GetComponentInParent<Nexus.Networking.NetworkedToken>();
+            if (netToken != null && netToken.netIdentity != null)
+            {
+                netToken.CmdEndDragFinal(position, rotation);
+                return true;
+            }
+
+            var netMovable = target.GetComponentInParent<Nexus.Networking.NetworkedMovable>();
+            if (netMovable != null && netMovable.netIdentity != null)
+            {
+                netMovable.CmdEndDragFinal(position, rotation);
+                return true;
+            }
+
+            return false;
         }
 
         private string SanitizePrefabName(string instanceName)
